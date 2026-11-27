@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import gc
+import os
+import re
 
 import comfy.model_management as mm
 import comfy.utils
+import folder_paths
 import torch
 
 from .ksr.runner import REPO, KandinskySR, count_tiles, load_model
 
 GB = 1024**3
+FP8_DIR = os.path.join(folder_paths.models_dir, "kandinsky_sr")
 _LOADED: dict = {"key": None, "model": None}
 
 
 def _log(message: str) -> None:
     print(f"[KandinskySR-Fast] {message}")
+
+
+def fp8_file_path(model: str) -> str:
+    """Where the pre-converted fp8 file for this model lives: ComfyUI/models/kandinsky_sr/<model>-fp8.safetensors."""
+    name = os.path.basename(os.path.normpath(model)) if os.path.isdir(model) else model.replace("/", "--")
+    return os.path.join(FP8_DIR, re.sub(r"[^A-Za-z0-9._-]+", "_", name) + "-fp8.safetensors")
 
 
 def _drop_loaded() -> None:
@@ -60,6 +70,15 @@ class KandinskySRFastLoader:
                         "10 GB) or a local folder containing the model's transformer/ and vae/ subfolders.",
                     },
                 ),
+                "fp8_cache": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Save the converted fp8 model (about 6 GB) to ComfyUI/models/kandinsky_sr. "
+                        "Whenever that file exists it is loaded instead of the original weights, whatever this "
+                        "switch says, so a machine that has the file does not need the 10 GB download.",
+                    },
+                ),
             },
         }
 
@@ -69,15 +88,21 @@ class KandinskySRFastLoader:
     CATEGORY = "image/upscaling"
     DESCRIPTION = "Loads Kandinsky ImageSR 2.0 with fp8 weights, cuDNN attention and torch.compile."
 
-    def load(self, precision: str, compile: bool, model: str = REPO):
-        key = (precision, bool(compile), model.strip() or REPO)
+    def load(self, precision: str, compile: bool, model: str = REPO, fp8_cache: bool = False):
+        repo = model.strip() or REPO
+        key = (precision, bool(compile), repo)
+        fp8_file = fp8_file_path(repo)
         if _LOADED["key"] != key:
             _drop_loaded()
             device = mm.get_torch_device()
             mm.free_memory((8 if precision == "fp8" else 12) * GB, device)
             mm.soft_empty_cache()
-            _LOADED["model"] = load_model(precision=precision, compile=compile, device=device, repo=key[2], log=_log)
+            _LOADED["model"] = load_model(
+                precision=precision, compile=compile, device=device, repo=repo, log=_log, fp8_file=fp8_file, save_fp8=fp8_cache
+            )
             _LOADED["key"] = key
+        elif fp8_cache and _LOADED["model"].precision == "fp8" and not os.path.isfile(fp8_file):
+            _LOADED["model"].save_fp8(fp8_file, repo)  # switch turned on after the model was already loaded
         return (_LOADED["model"],)
 
 

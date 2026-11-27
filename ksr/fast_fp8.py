@@ -144,10 +144,14 @@ def convert_to_fp8(model: nn.Module, device: torch.device | str) -> int:
         bias = child.bias.detach().to(device) if child.bias is not None else None
         setattr(parent, name, FastFP8Linear(qweight, scale, bias))
         del child
-    converted = len(targets)
+    use_fp8_attention(model)
+    return len(targets)
+
+
+def use_fp8_attention(model: nn.Module) -> None:
+    """Give every attention block whose q/k/v layers are fp8 the processor that quantizes their input once."""
     for module in model.modules():
         if isinstance(module, Kandinsky5Attention) and all(
             isinstance(getattr(module, name), FastFP8Linear) for name in ("to_query", "to_key", "to_value")
         ):
             module.set_processor(FastFP8AttnProcessor())
-    return converted

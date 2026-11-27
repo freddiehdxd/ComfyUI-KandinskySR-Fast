@@ -27,20 +27,21 @@
       "id": 2,
       "type": "KandinskySRFastLoader",
       "pos": [100, 500],
-      "size": [348.31796875, 106],
+      "size": [348.31796875, 130],
       "flags": {},
       "order": 1,
       "mode": 0,
       "inputs": [
         {"localized_name": "precision", "name": "precision", "type": "COMBO", "widget": {"name": "precision"}, "link": null},
         {"localized_name": "compile", "name": "compile", "type": "BOOLEAN", "widget": {"name": "compile"}, "link": null},
-        {"localized_name": "model", "name": "model", "shape": 7, "type": "STRING", "widget": {"name": "model"}, "link": null}
+        {"localized_name": "model", "name": "model", "shape": 7, "type": "STRING", "widget": {"name": "model"}, "link": null},
+        {"localized_name": "fp8_cache", "name": "fp8_cache", "shape": 7, "type": "BOOLEAN", "widget": {"name": "fp8_cache"}, "link": null}
       ],
       "outputs": [
         {"localized_name": "sr_model", "name": "sr_model", "type": "KANDINSKY_SR", "links": [1]}
       ],
       "properties": {"Node name for S&R": "KandinskySRFastLoader"},
-      "widgets_values": ["fp8", true, "kandinskylab/Kandinsky-ImageSR-2.0"]
+      "widgets_values": ["fp8", true, "kandinskylab/Kandinsky-ImageSR-2.0", false]
     },
     {
       "id": 3,

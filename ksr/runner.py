@@ -10,15 +10,18 @@ This module has no ComfyUI imports, so it can also be used from a plain Python s
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import time
 import types
 from collections.abc import Callable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from .fast_fp8 import convert_to_fp8, fp8_supported
+from .fast_fp8 import FastFP8Linear, convert_to_fp8, fp8_supported, use_fp8_attention
 from .vae_opt import use_matmul_attention
 from .vendor.baked_transformer import KandinskyImageSRBakedTransformer3DModel
 from .vendor.tiling import boundary_aware_window, pad_to_min_tile, tile_positions
@@ -32,6 +35,62 @@ CREATIVITY_TIMESTEPS = {
     4: (0.17, 0.1885, 0.207, 0.2255, 0.244, 0.278, 0.312, 0.346, 0.38),
 }
 GPU_ACCUMULATOR_LIMIT = 2 * 1024**3  # blend on the GPU unless the output canvas needs more than this
+FP8_FILE_FORMAT = "kandinsky-sr-fast-fp8"  # single safetensors file: fp8 transformer + VAE + both configs
+
+
+def save_fp8_file(transformer, vae, path: str | Path, source: str) -> None:
+    """Write the converted fp8 transformer and the VAE to one safetensors file (about 6 GB)."""
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for prefix, module in (("transformer.", transformer), ("vae.", vae)):
+        for key, value in module.state_dict().items():
+            tensors[prefix + key.replace("_orig_mod.", "")] = value.detach().to("cpu").contiguous()
+    metadata = {
+        "format": FP8_FILE_FORMAT,
+        "version": "1",
+        "source": source,
+        "transformer_config": transformer.to_json_string(),
+        "vae_config": vae.to_json_string(),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".partial")
+    save_file(tensors, str(partial), metadata=metadata)
+    os.replace(partial, path)  # never leave a half-written file under the final name
+
+
+def load_fp8_file(path: str | Path, device: torch.device):
+    """Build the fp8 transformer and the VAE straight from a file written by `save_fp8_file`."""
+    from accelerate import init_empty_weights
+    from diffusers import AutoencoderKL
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    with safe_open(str(path), framework="pt") as handle:
+        metadata = handle.metadata() or {}
+    if metadata.get("format") != FP8_FILE_FORMAT:
+        raise ValueError("not a Kandinsky ImageSR Fast fp8 file")
+    state = load_file(str(path), device=str(device))
+    transformer_state = {k.removeprefix("transformer."): v for k, v in state.items() if k.startswith("transformer.")}
+    vae_state = {k.removeprefix("vae."): v for k, v in state.items() if k.startswith("vae.")}
+    del state
+
+    with init_empty_weights():  # no 5-billion-parameter random init
+        transformer = KandinskyImageSRBakedTransformer3DModel.from_config(json.loads(metadata["transformer_config"]))
+    for key in [key for key in transformer_state if key.endswith(".qweight")]:
+        name = key.removesuffix(".qweight")
+        parent_name, _, child_name = name.rpartition(".")
+        layer = FastFP8Linear(
+            transformer_state[key], transformer_state[name + ".weight_scale"], transformer_state.get(name + ".bias")
+        )
+        setattr(transformer.get_submodule(parent_name), child_name, layer)
+    transformer.load_state_dict(transformer_state, strict=True, assign=True)
+    use_fp8_attention(transformer)
+
+    vae = AutoencoderKL.from_config(json.loads(metadata["vae_config"]))
+    vae.load_state_dict(vae_state, strict=True, assign=True)
+    return transformer, vae
 
 
 def _nearest_timestep_indices(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -98,6 +157,15 @@ class KandinskySR:
         self.transformer, self.vae.encoder, self.vae.decoder = self._eager
         self._eager = None
         self.compiled = False
+
+    def save_fp8(self, path: str | Path, source: str = REPO) -> None:
+        """Write this (fp8) model to a single file that `load_model(fp8_file=...)` can load directly."""
+        if self.precision != "fp8":
+            raise RuntimeError("only an fp8 model can be saved as an fp8 file")
+        transformer = self._eager[0] if self._eager is not None else self.transformer
+        start = time.perf_counter()
+        save_fp8_file(transformer, self.vae, path, source)
+        self.log(f"saved the fp8 model to {path} in {time.perf_counter() - start:.0f} s")
 
     def to(self, device: torch.device | str) -> KandinskySR:
         device = torch.device(device)
@@ -213,12 +281,16 @@ def load_model(
     device: torch.device | str = "cuda",
     repo: str = REPO,
     log: Callable[[str], None] = print,
+    fp8_file: str | Path | None = None,
+    save_fp8: bool = False,
 ) -> KandinskySR:
     """Download (first time) and load the model, then apply the speed-ups.
 
     precision: "fp8" quantizes the transformer's linear layers in memory and runs them as fp8 GEMMs (about 6 GB of
         VRAM instead of 10); "bf16" keeps the original weights. fp8 falls back to bf16 on GPUs without fp8 support.
     compile: torch.compile on the transformer and the VAE (needs triton); skipped with a message if unavailable.
+    fp8_file: path of a pre-converted fp8 file. If it exists it is loaded instead of `repo` (nothing is downloaded);
+        if it does not exist and `save_fp8` is set, it is written after converting.
     """
     from diffusers import AutoencoderKL
 
@@ -227,22 +299,36 @@ def load_model(
         raise RuntimeError("Kandinsky ImageSR Fast needs an NVIDIA GPU (CUDA device).")
     if precision not in ("fp8", "bf16"):
         raise ValueError(f"precision must be 'fp8' or 'bf16', got {precision!r}")
+    if precision == "fp8" and not fp8_supported(device):
+        precision = "bf16"
+        log("this GPU has no fp8 matmul support; using bf16 instead")
 
     start = time.perf_counter()
-    transformer = KandinskyImageSRBakedTransformer3DModel.from_pretrained(
-        repo, subfolder="transformer", torch_dtype=torch.bfloat16
-    )
-    if bool(getattr(transformer.config, "visual_cond", False)):
-        raise RuntimeError("this checkpoint uses visual conditioning, which this node does not implement")
-    if precision == "fp8":
-        if fp8_supported(device):
+    transformer = vae = None
+    source = "original weights"
+    if precision == "fp8" and fp8_file is not None and Path(fp8_file).is_file():
+        try:
+            transformer, vae = load_fp8_file(fp8_file, device)
+            source = f"fp8 file {Path(fp8_file).name}"
+        except Exception as error:  # noqa: BLE001 - an unreadable file must not block loading
+            transformer = vae = None
+            log(f"could not load {fp8_file} ({type(error).__name__}: {str(error)[:200]}); converting in memory instead")
+    if transformer is None:
+        transformer = KandinskyImageSRBakedTransformer3DModel.from_pretrained(
+            repo, subfolder="transformer", torch_dtype=torch.bfloat16
+        )
+        if precision == "fp8":
             converted = convert_to_fp8(transformer, device)  # layer by layer, before the rest moves to the GPU
             log(f"quantized {converted} linear layers to fp8")
-        else:
-            precision = "bf16"
-            log("this GPU has no fp8 matmul support; using bf16 instead")
+        vae = AutoencoderKL.from_pretrained(repo, subfolder="vae", torch_dtype=torch.bfloat16)
+        if precision == "fp8" and save_fp8 and fp8_file is not None:
+            save_start = time.perf_counter()
+            save_fp8_file(transformer, vae, fp8_file, repo)
+            log(f"saved the fp8 model to {fp8_file} in {time.perf_counter() - save_start:.0f} s")
+    if bool(getattr(transformer.config, "visual_cond", False)):
+        raise RuntimeError("this checkpoint uses visual conditioning, which this node does not implement")
     transformer = transformer.to(device).eval()
-    vae = AutoencoderKL.from_pretrained(repo, subfolder="vae", torch_dtype=torch.bfloat16).to(device).eval()
+    vae = vae.to(device).eval()
 
     transformer._timestep_indices = types.MethodType(_nearest_timestep_indices, transformer)
     attention = "default"
@@ -256,7 +342,7 @@ def load_model(
     if compile:
         model.enable_compile()
     log(
-        f"loaded in {time.perf_counter() - start:.1f} s: {precision} transformer, {attention} attention, "
+        f"loaded in {time.perf_counter() - start:.1f} s from {source}: {precision} transformer, {attention} attention, "
         f"torch.compile {'on' if model.compiled else 'off'}, {torch.cuda.memory_allocated(device) / 1024**3:.1f} GB VRAM"
     )
     return model

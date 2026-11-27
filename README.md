@@ -4,7 +4,7 @@ Fast ComfyUI nodes for [Kandinsky ImageSR 2.0](https://huggingface.co/kandinskyl
 
 The nodes run the original weights through a faster path:
 
-- **fp8 transformer** — the linear layers are quantized to fp8 in memory at load time and run as fp8 matmuls. No separate fp8 download and no quantization library.
+- **fp8 transformer** — the linear layers are quantized to fp8 in memory at load time and run as fp8 matmuls. No separate fp8 download and no quantization library. The converted model can optionally be saved to a single 6 GB file and reused.
 - **cuDNN attention** on Windows, where PyTorch ships without FlashAttention.
 - **torch.compile** on the transformer and the VAE (optional, needs triton).
 - **Faster VAE attention** for the 1024 px tiles.
@@ -58,6 +58,17 @@ Both are under **image → upscaling**. An example workflow is in `example_workf
 | `precision` | `fp8` | `fp8` is fastest and uses the least VRAM. `bf16` runs the original weights. `fp8` falls back to `bf16` on GPUs without fp8 matmul support. |
 | `compile` | on | Use `torch.compile` (see above). |
 | `model` | `kandinskylab/Kandinsky-ImageSR-2.0` | Hugging Face repo id, or a local folder that contains the model's `transformer/` and `vae/` subfolders. |
+| `fp8_cache` | off | Save the converted fp8 model to `ComfyUI/models/kandinsky_sr/` (see below). |
+
+#### Pre-converted fp8 file
+
+With `fp8_cache` on, the loader writes the converted model (fp8 transformer plus VAE, about 6 GB) to
+
+```
+ComfyUI/models/kandinsky_sr/kandinskylab--Kandinsky-ImageSR-2.0-fp8.safetensors
+```
+
+Whenever that file exists and `precision` is `fp8`, the loader uses it instead of the original weights, whether or not the switch is on. The result is identical to converting in memory; loading is a couple of seconds faster, and a machine that has the file does not need the 10 GB original download. Delete the file to go back to converting in memory.
 
 ### Kandinsky ImageSR 2.0 Upscale (Fast)
 
