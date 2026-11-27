@@ -1,0 +1,4 @@
+diffusers>=0.40.0
+accelerate>=0.31.0
+safetensors
+huggingface-hub
